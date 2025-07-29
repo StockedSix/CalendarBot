@@ -270,8 +270,12 @@ async def play(ctx, *, query):
         entry = {'url': audio_url, 'title': title}
 
         if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
-            queue.append(entry)
-            await ctx.send(f"🎶 Added to queue: {title}")
+            queue.append([entry, ctx.author.id])
+            author_id = ctx.author.id
+            author = ctx.guild.get_member(author_id)
+            author_name = author.display_name if author else f"User ID {author_id}"
+            await ctx.send(f"🎶 Added to queue: {title} (added by {author_name})")
+
         else:
             source = ffmpeg_audio = FFmpegPCMAudio(audio_url, before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5")
             audio_src = PCMVolumeTransformer(source, volume=0.2)
@@ -323,34 +327,49 @@ async def skip(ctx):
 
 # QUEUE MANAGEMENT
 def play_next(ctx, voice_client):
-    queue = get_queue(ctx.guild.id)
+    queue = get_queue(ctx.guild.id)  # This is a deque of [song_info, author_id]
 
     if queue:
-        next_entry = queue.popleft()
-        source = FFmpegPCMAudio(next_entry['url'], before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5")
+        next_entry = queue.popleft()  # next_entry is [song_info, author_id]
+        song_info = next_entry[0]
+        source = FFmpegPCMAudio(song_info['url'], before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5")
         audio = PCMVolumeTransformer(source, volume=0.2)
-        voice_client.play(audio, after=lambda e: play_next(ctx, voice_client))
-        coro = ctx.send(f"🎶 Now playing: {next_entry['title']}")
+        def after_play(error):
+            if error:
+                print(f"Playback error: {error}")
+            # Schedule next song playback safely in the event loop
+            bot.loop.call_soon_threadsafe(play_next, ctx, voice_client)
+        voice_client.play(audio, after=after_play)
+        coro = ctx.send(f"🎶 Now playing: {song_info['title']}")
         bot.loop.create_task(coro)
     else:
         coro = voice_client.disconnect()
         bot.loop.create_task(coro)
 
+
 @bot.command()
 async def queue(ctx):
     queue = get_queue(ctx.guild.id)
     if not queue:
-        await ctx.send("The queue is empty!")
+        await ctx.send("The queue is empty!", delete_after=5)
         return
 
-    # Prepare a formatted list of songs (up to 10 to avoid spam)
-    queue_list = [f"{idx + 1}. {entry['title']}" for idx, entry in enumerate(queue)]
+    # Prepare a formatted list of songs (up to 10)
+    queue_list = []
+    for idx, entry in enumerate(queue):
+        song = entry[0]          # the song dict/object
+        author_id = entry[1]     # author's user ID
+        author = ctx.guild.get_member(author_id)  # get Member object if possible
+        author_name = author.display_name if author else f"User ID {author_id}"
+        queue_list.append(f"{idx + 1}. {song['title']} (added by {author_name})")
+
     queue_text = "\n".join(queue_list[:10])
 
     if len(queue) > 10:
         queue_text += f"\n...and {len(queue) - 10} more songs."
 
     await ctx.send(f"**Current Queue:**\n{queue_text}")
+
 
 @bot.command()
 async def clearqueue(ctx):
@@ -375,7 +394,7 @@ async def removequeue(ctx, index: int):
 
     removed_entry = queue[index - 1]
     del queue[index - 1]
-    await ctx.send(f"✅ Removed '{removed_entry['title']}' from the queue.")
+    await ctx.send(f"✅ Removed '{removed_entry[0]['title']}' from the queue.")
 
 # GIFT LINK
 @bot.command()

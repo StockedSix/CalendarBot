@@ -1,19 +1,19 @@
 # IMPORT
 import discord
-from discord.ext import commands, tasks
 from discord import app_commands
 from discord import FFmpegPCMAudio, PCMVolumeTransformer
-from discord.ext import commands
+from discord.ext import commands, tasks
 from collections import deque
 import os
 from dotenv import load_dotenv
 import asyncio
 import re
-from datetime import datetime
+import datetime
 import mysql.connector
 import yt_dlp
 from yt_dlp.utils import DownloadError
 import validators
+import traceback
 
 # LOAD ENV AND INTENTS
 intents = discord.Intents.default()
@@ -60,6 +60,14 @@ commandList = {
     "skip": "Skip the currently playing song.",
     "code": "Generate a gift link for a code (GI/HSR): '{operator}gift <gi|hsr> <CODE>'",
     "gift": "Generate Hoyoverse gift links for GI or HSR: '{operator}gift <gi|hsr> <CODE1> [<CODE2> ...])'"
+}
+
+gameList = {
+    "gi": "Genshin Impact",
+    "hsr": "Honkai: Star Rail",
+    "zzz": "Zenless Zone Zero",
+    "wuwa": "Wuthering Waves",
+    "gfl": "Girls Frontline 2"
 }
 
 # HELP COMMAND
@@ -157,6 +165,66 @@ async def interval(ctx):
     await ctx.send(msg)
 
 # CALENDAR BATCH 
+@bot.command()
+async def calendarbatch(ctx, game: str):
+    try:
+
+        if game not in gameList:
+            await ctx.send("❌ Valid games are: gi", delete_after=5)
+            return
+        
+        curServID = ctx.guild.id
+        cursor.execute("SELECT * FROM new_table WHERE batchlinked_server = %s and batchlinked_game = %s", (curServID, game))
+        result = cursor.fetchone()
+
+        if result is not None:
+            try:
+                channel = bot.get_channel(result[1])
+                message = await channel.fetch_message(result[0])
+                if message:
+                    await ctx.send(f"❌ Batch for {game} already exists in this server. Please delete existing batch first.", delete_after=5)
+                    return
+            except discord.NotFound:
+                # Message not found, delete from database and CONTINUE execution
+                cursor.execute("DELETE FROM new_table WHERE batchlinked_id = %s", (result[0],))
+                db.commit()
+                #await ctx.send(f"⚠️ Batch message not found. Deleted from database, proceeding to create new batch.")
+
+        cursor.execute(""" 
+        SELECT batch_nexttime, batch_interval, batch_content, batch_intervalvar, batch_type
+        FROM batch_table
+        WHERE batch_game = %s
+        """, (game,))
+        batch_data = cursor.fetchall()
+        if not batch_data:
+            await ctx.send(f"❌ No existing batch found for {game}. Please create one first.", delete_after=5)
+            return
+        batch_data.sort(key=lambda x: x[0])  # Sort by next time
+        content = f"{gameList.get(game, game)} batch reminder: \n"
+
+        for batch in batch_data:
+            if batch[4] == 0:
+                content += f"{batch[2]}: <t:{batch[0]}:F> <t:{batch[0]}:R> `(every {batch[3]})`\n"
+            elif batch[4] == 1:
+                curSuffix = daySuffix(batch[3])
+                content += f"{batch[2]}: <t:{batch[0]}:F> <t:{batch[0]}:R> `(every {batch[3]}{curSuffix})`\n"
+        batch_msg = await ctx.send(content)
+
+        print(batch_msg.id)
+        cursor.execute("""
+            INSERT INTO new_table
+            (batchlinked_id, batchlinked_channel, batchlinked_server, batchlinked_user, batchlinked_game)
+            VALUES (%s, %s, %s, %s, %s)
+            """, (batch_msg.id, batch_msg.channel.id, ctx.guild.id, ctx.author.id, game))
+            
+        db.commit()
+        await ctx.send(f"✅ Batch for {game} created successfully in this server.", delete_after=5)
+
+    except Exception as e:
+        print(f"calendarbatch error: {e}")
+        await ctx.send("❌ Error checking existing batch.", delete_after=5)
+        return
+
 
 
 ##
@@ -251,7 +319,7 @@ async def skip(ctx):
     await ctx.send("⏭️ Skipping the current song.")
 
     voice_client.stop()
-    play_next(ctx, voice_client)
+    #play_next(ctx, voice_client)
 
 # QUEUE MANAGEMENT
 def play_next(ctx, voice_client):
@@ -268,6 +336,46 @@ def play_next(ctx, voice_client):
         coro = voice_client.disconnect()
         bot.loop.create_task(coro)
 
+@bot.command()
+async def queue(ctx):
+    queue = get_queue(ctx.guild.id)
+    if not queue:
+        await ctx.send("The queue is empty!")
+        return
+
+    # Prepare a formatted list of songs (up to 10 to avoid spam)
+    queue_list = [f"{idx + 1}. {entry['title']}" for idx, entry in enumerate(queue)]
+    queue_text = "\n".join(queue_list[:10])
+
+    if len(queue) > 10:
+        queue_text += f"\n...and {len(queue) - 10} more songs."
+
+    await ctx.send(f"**Current Queue:**\n{queue_text}")
+
+@bot.command()
+async def clearqueue(ctx):
+    queue = get_queue(ctx.guild.id)
+    if not queue:  
+        await ctx.send("The queue is already empty!", remove_after=5)
+        return
+
+    queue.clear()
+    await ctx.send("✅ Cleared the queue.")
+
+@bot.command()
+async def removequeue(ctx, index: int):
+    queue = get_queue(ctx.guild.id)
+    if not queue:
+        await ctx.send("The queue is empty!", remove_after=5)
+        return
+
+    if index < 1 or index > len(queue):
+        await ctx.send(f"❌ Invalid index. Please provide a number between 1 and {len(queue)}.", remove_after=5)
+        return
+
+    removed_entry = queue[index - 1]
+    del queue[index - 1]
+    await ctx.send(f"✅ Removed '{removed_entry['title']}' from the queue.")
 
 # GIFT LINK
 @bot.command()
@@ -370,10 +478,32 @@ async def on_message(message):
 ### PARSING ###################################################################################################################
 ##
 
+# EDIT BATCH MESSAGES
+async def editBatchMessage(batch_game, new_content):
+    try:    
+        cursor.execute("""
+            SELECT batchlinked_id, batchlinked_channel, batchlinked_server
+            FROM new_table
+            WHERE batchlinked_game = %s
+        """, (batch_game,))
+        messages = cursor.fetchall()
+        for messageID, channelID, serverID in messages:
+            channel = bot.get_channel(channelID)
+            messageToEdit = await channel.fetch_message(messageID)
+            
+            await messageToEdit.edit(content=new_content)
+        print("Edited batch messages for game:", batch_game, "in", len(messages), "servers.")
+
+    except discord.NotFound:
+        cursor.execute("DELETE FROM new_table WHERE batchlinked_id = %s", (messageID,))
+        db.commit()
+    except Exception as e:
+        print(f"Error editing batch message for {batch_game}: {e}")
+
 # REMINDER CHECK LOOP 
 @tasks.loop(seconds=reminderCheckInterval)
 async def check_reminders():
-    now = int(datetime.now().timestamp())
+    now = int(datetime.datetime.now().timestamp())
     cursor.execute("""
         SELECT reminder_id, reminder_channel, reminder_user, reminder_nexttime,
         reminder_interval, reminder_content, reminder_intervalvar
@@ -406,6 +536,126 @@ async def check_reminders():
         except Exception as e:
             print(f"Reminder update error for {messageID}: {e}")
 
+# BATCH CHECK LOOP
+@tasks.loop(seconds=reminderCheckInterval)
+async def check_batch():
+    dueCheck = []
+    due = []
+    now = int(datetime.datetime.now().timestamp())
+    cursor.execute("""
+        SELECT batch_game, batch_nexttime
+        FROM batch_table
+    """)	
+    dueCheck = cursor.fetchall()
+    if not dueCheck:
+        return
+    for row in dueCheck:
+        if row[1] <= now:
+            due.append(row)
+    due_set = set(row[0] for row in due)
+
+    for game in due_set:
+        try:
+            cursor.execute("""
+                SELECT batch_id, batch_game, batch_nexttime, batch_interval, batch_content, batch_intervalvar, batch_type
+                FROM batch_table 
+                WHERE batch_game = %s
+            """, (game,))
+            batch_data = cursor.fetchall()
+
+            if batch_data:
+                # Process the batch data
+                print(f"Processing batch for {game} at {now}.")
+                for batch in batch_data:
+                        if batch[2] <= now:
+                            if batch[6] == 0:  # If batch_type is 0, it's a normal reminder
+                                new_time = batch[2] + batch[3]
+
+                                # Update the next time for the batch
+                                cursor.execute(
+                                    "UPDATE batch_table SET batch_nexttime = %s WHERE batch_id = %s",
+                                    (new_time, batch[0])
+                                )
+                                db.commit()
+                            if batch[6] == 1:  # If batch_type is 1, it's a date reminder
+                                new_time = parseDateUpdate(batch[5], batch[2])
+
+                                # Update the next time for the batch
+                                cursor.execute(
+                                    "UPDATE batch_table SET batch_nexttime = %s WHERE batch_id = %s",
+                                    (new_time, batch[0])
+                                )
+                                db.commit()
+
+                cursor.execute("""
+                SELECT batch_id, batch_game, batch_nexttime, batch_interval, batch_content, batch_intervalvar, batch_type
+                FROM batch_table 
+                WHERE batch_game = %s
+                """, (game,))
+                batch_data = cursor.fetchall()
+
+                batch_data.sort(key=lambda x: x[2])
+                content = f"{gameList.get(game, game)} batch reminders: \n"
+                for batch in batch_data:
+                    if batch[6] == 0:  # If batch_type is 0, it's a normal reminder
+                        content += f"{batch[4]}: <t:{batch[2]}:F> <t:{batch[2]}:R> `(every {batch[5]})`\n"
+                    if batch[6] == 1:  # If batch_type is 1, it's a date reminder
+                        curSuffix = daySuffix(batch[5])
+                        content += f"{batch[4]}: <t:{batch[2]}:F> <t:{batch[2]}:R> `(every {batch[5]}{curSuffix})`\n"
+
+                await editBatchMessage(game, content)
+                
+        except Exception as e:
+            print(f"Batch processing error for {game}: {e}")
+            traceback.print_exc()
+
+
+def parseDateUpdate(dateInfo, currentTime):
+    dateInfo = int(dateInfo)
+    currentDT = datetime.datetime.fromtimestamp(currentTime)
+
+    year = currentDT.year
+    month = currentDT.month
+    day = currentDT.day
+
+    if day < dateInfo:
+        try:
+            targetDate = datetime.datetime(year, month, dateInfo, currentDT.hour, currentDT.minute, currentDT.second)
+        except ValueError:
+            # fallback: if invalid day, go to last day of this month
+            if month == 12:
+                nextMonthFirst = datetime.datetime(year + 1, 1, 1, currentDT.hour, currentDT.minute, currentDT.second)
+            else:
+                nextMonthFirst = datetime.datetime(year, month + 1, 1, currentDT.hour, currentDT.minute, currentDT.second)
+            lastDay = nextMonthFirst - datetime.timedelta(days=1)
+            targetDate = datetime.datetime(year, month, lastDay.day, currentDT.hour, currentDT.minute, currentDT.second)
+    else:
+        # move to next month
+        if month == 12:
+            year += 1
+            month = 1
+        else:
+            month += 1
+        try:
+            targetDate = datetime.datetime(year, month, dateInfo, currentDT.hour, currentDT.minute, currentDT.second)
+        except ValueError:
+            # fallback: last day of next month
+            if month == 12:
+                nextMonthFirst = datetime.datetime(year + 1, 1, 1, currentDT.hour, currentDT.minute, currentDT.second)
+            else:
+                nextMonthFirst = datetime.datetime(year, month + 1, 1, currentDT.hour, currentDT.minute, currentDT.second)
+            lastDay = nextMonthFirst - datetime.timedelta(days=1)
+            targetDate = datetime.datetime(year, month, lastDay.day, currentDT.hour, currentDT.minute, currentDT.second)
+
+    deltaSeconds = (targetDate - currentDT).total_seconds()
+    return int(currentTime + deltaSeconds)
+
+def daySuffix(day):
+    day = int(day)
+    if 10 <= day % 100 <= 13:
+        return 'th'
+    else:
+        return {1: 'st', 2: 'nd', 3: 'rd'}.get(day % 10, 'th')
 
 # PARSE DURATION
 def parseDuration(preDuration):
@@ -420,6 +670,7 @@ def parseDuration(preDuration):
 async def on_ready():
     print(f'Logged in as {bot.user}')
     check_reminders.start()
+    check_batch.start()
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} slash commands.")

@@ -50,16 +50,21 @@ cursor = db.cursor()
 # COMMAND LIST
 commandList = {
     "calendarset": "Make a repeating reminder: '{operator}calendarset {{UNIXTIMESTAMP}} {{INTERVAL}} {{MESSAGE}}'",
+    "calendarbatch": "Create a batch reminder for a game: '{operator}calendarbatch <gi>'",
     "delmes": "Delete a reminder by replying to it.",
     "curunix": "Print current Unix timestamp.",
     "interval": "View interval formatting help.",
     "findtime": "Convert UTC datetime to Unix: '{operator}findtime YYYY-MM-DD HH:MM'",
     "help": "Show this help message.",
-    "play": "Play a YouTube audio stream in a voice channel: '{operator}play <URL>'",
-    "stop": "Stop playing music and leave the voice channel.",
     "skip": "Skip the currently playing song.",
     "code": "Generate a gift link for a code (GI/HSR): '{operator}gift <gi|hsr> <CODE>'",
-    "gift": "Generate Hoyoverse gift links for GI or HSR: '{operator}gift <gi|hsr> <CODE1> [<CODE2> ...])'"
+    "gift": "Generate Hoyoverse gift links for GI or HSR: '{operator}gift <gi|hsr> <CODE1> [<CODE2> ...])'",
+    "play": "Play a YouTube audio stream in a voice channel: '{operator}play <URL>'",
+    "stop": "Stop playing music and leave the voice channel.",
+    "queue": "View the current music queue: '{operator}queue'",
+    "clearqueue": "Clear the current music queue: '{operator}clearqueue'",
+    "removequeue": "Remove a song from the queue by index: '{operator}removequeue <index>'"
+
 }
 
 gameList = {
@@ -87,7 +92,7 @@ async def help(ctx):
 async def calendarset(ctx, timestamp: int, interval: str, *, msg: str):
     try:
         unixValue = parseDuration(interval)
-        curTime = int(datetime.now().timestamp())
+        curTime = int(datetime.datetime.now().timestamp())
 
         if timestamp < curTime - unixValue + 1:
             await ctx.send("❌ Timestamp is too far in the past.", delete_after=5)
@@ -144,13 +149,13 @@ async def delmes(ctx):
 # CURUNIX
 @bot.command()
 async def curunix(ctx):
-    await ctx.send(f"Current Unix timestamp: {int(datetime.now().timestamp())}")
+    await ctx.send(f"Current Unix timestamp: {int(datetime.datetime.now().timestamp())}")
 
 # FINDTIME
 @bot.command()
 async def findtime(ctx, *, content):
     try:
-        ts = int(dt.timestamp())
+        ts = int(datetime.datetime.timestamp(datetime.datetime.strptime(content.strip(), "%Y-%m-%d %H:%M")))
         await ctx.send(f"The Unix timestamp for `{content}` is: {ts} (<t:{ts}:F>)")
     except ValueError:
         await ctx.send("❌ Use format: YYYY-MM-DD HH:MM")

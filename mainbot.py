@@ -18,6 +18,7 @@ import traceback
 # LOAD ENV AND INTENTS
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 load_dotenv()
 
 # CONFIG
@@ -155,7 +156,7 @@ async def curunix(ctx):
 @bot.command()
 async def findtime(ctx, *, content):
     try:
-        ts = int(datetime.datetime.timestamp(datetime.datetime.strptime(content.strip(), "%Y-%m-%d %H:%M")))
+        ts = int(datetime.datetime.timestamp())
         await ctx.send(f"The Unix timestamp for `{content}` is: {ts} (<t:{ts}:F>)")
     except ValueError:
         await ctx.send("❌ Use format: YYYY-MM-DD HH:MM")
@@ -239,60 +240,172 @@ async def calendarbatch(ctx, game: str):
 # YOUTUBE MUSIC PLAYER
 @bot.command()
 async def play(ctx, *, query):
-
     if not ctx.author.voice:
         await ctx.send("❌ You must be in a voice channel.")
         return
-    query = query.strip().replace("<", "").replace(">", "")
 
+    query = query.strip().replace("<", "").replace(">", "")
     isURL = validators.url(query) and ("youtube.com" in query or "youtu.be" in query)
+    # detect playlist URLs (YouTube uses "list=" query param)
+    is_playlist_url = isURL and ("list=" in query or "playlist" in query)
+
     searchQuery = query if isURL else f"ytsearch:{query}"
 
     channel = ctx.author.voice.channel
     if not ctx.voice_client:
         await channel.connect()
 
+    poToken = os.getenv("POTOKEN")
+
+    # normalize to the expected GVS format if not already prefixed
+    if poToken and not poToken.startswith("mweb.gvs+"):
+        poToken = f"mweb.gvs+{poToken}"
+
+    # collect yt-dlp internal logs so we can print the full log on error
+    log_buffer = []
+    class YTDLLogger:
+        def debug(self, msg):
+            log_buffer.append(f"DEBUG: {msg}")
+        def info(self, msg):
+            log_buffer.append(f"INFO: {msg}")
+        def warning(self, msg):
+            log_buffer.append(f"WARNING: {msg}")
+        def error(self, msg):
+            log_buffer.append(f"ERROR: {msg}")
+
+    ydl_logger = YTDLLogger()
+
+    # build extractor_args correctly — include po_token only if provided
+    youtube_extractor_args = {'player_client': 'mweb'}
+    if poToken:
+        youtube_extractor_args['po_token'] = poToken
 
     ydl_opts = {
-        'options': '-vn',
-        "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-        'format': 'bestaudio', 'quiet': True, 'cookiefile': 'cookies.txt'}
+        # prefer any best audio (m4a / opus / etc.) and fall back to best
+        'format': 'bestaudio/best',
+        'merge_output_format': 'mp4',
+        'quiet': False,
+        'no_warnings': False,
+        'logger': ydl_logger,
+        'extractor_args': {
+            'youtube': youtube_extractor_args
+        },
+        # allow playlists when a playlist URL was provided
+        'noplaylist': not is_playlist_url,
+        'default_search': 'auto',
+    }
+
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(searchQuery, download=False)
-            if 'entries' in info:  # Handle search result
-                info = info['entries'][0]
-            audio_url = info.get('url')
+            try:
+                info = ydl.extract_info(searchQuery, download=False)
+            except Exception as e:
+                # print full yt-dlp log buffer and traceback for debugging
+                print("yt-dlp exception while extracting info:", e)
+                if log_buffer:
+                    print("=== yt-dlp log start ===")
+                    for line in log_buffer:
+                        print(line)
+                    print("=== yt-dlp log end ===")
+                traceback.print_exc()
+                raise
 
-        audio_url = info.get('url')
-        title = info.get('title', 'Unknown Title')
+            entries = []
+            # If yt-dlp returned multiple entries (search results or playlist)
+            if isinstance(info, dict) and 'entries' in info:
+                # If this is a playlist (or a playlist URL), process all entries
+                if is_playlist_url or info.get('_type') == 'playlist':
+                    for e in info['entries']:
+                        if not e:
+                            continue
+                        entries.append(e)
+                else:
+                    # non-playlist lists (e.g., ytsearch) -> take first match
+                    first = info['entries'][0] if info['entries'] else None
+                    if first:
+                        entries.append(first)
+            else:
+                # single video info
+                entries.append(info)
 
-        if not audio_url:
-            await ctx.send("❌ Could not retrieve audio stream.")
+            # build list of song dicts with direct audio urls
+            songs = []
+            for item in entries:
+                title = item.get('title', 'Unknown Title')
+                audio_url = None
+                # Prefer m4a audio-only stream, fall back to any audio-only, then to general url
+                for f in item.get('formats', []):
+                    if f.get('acodec') != 'none' and f.get('vcodec') == 'none' and f.get('ext') == 'm4a':
+                        audio_url = f.get('url')
+                        break
+                if not audio_url:
+                    for f in item.get('formats', []):
+                        if f.get('acodec') != 'none' and f.get('vcodec') == 'none':
+                            audio_url = f.get('url')
+                            break
+                if not audio_url:
+                    audio_url = item.get('url') or item.get('webpage_url')
+                if audio_url:
+                    songs.append({'url': audio_url, 'title': title})
+                else:
+                    print(f"Could not find audio url for {title} ({item.get('id')})")
+                    if log_buffer:
+                        print("=== yt-dlp log start ===")
+                        for line in log_buffer:
+                            print(line)
+                        print("=== yt-dlp log end ===")
+
+        if not songs:
+            await ctx.send("❌ Could not retrieve any audio streams from the provided query/playlist.")
             return
-        
-        queue  = get_queue(ctx.guild.id)
-        entry = {'url': audio_url, 'title': title}
 
+        queue = get_queue(ctx.guild.id)
+
+        # If currently playing, append all songs to the queue
         if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
-            queue.append([entry, ctx.author.id])
-            author_id = ctx.author.id
-            author = ctx.guild.get_member(author_id)
-            author_name = author.display_name if author else f"User ID {author_id}"
-            await ctx.send(f"🎶 Added to queue: {title} (added by {author_name})")
-
+            for s in songs:
+                queue.append([s, ctx.author.id])
+            author = ctx.guild.get_member(ctx.author.id)
+            author_name = author.display_name if author else f"User ID {ctx.author.id}"
+            if len(songs) == 1:
+                await ctx.send(f"🎶 Added to queue: {songs[0]['title']} (added by {author_name})")
+            else:
+                await ctx.send(f"🎶 Added {len(songs)} songs from the playlist to the queue (added by {author_name})")
         else:
-            source = ffmpeg_audio = FFmpegPCMAudio(audio_url, before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5")
+            # Play the first song immediately, queue the rest
+            first = songs.pop(0)
+            for s in songs:
+                queue.append([s, ctx.author.id])
+
+            source = FFmpegPCMAudio(
+                first['url'],
+                before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+            )
             audio_src = PCMVolumeTransformer(source, volume=0.2)
             ctx.voice_client.play(audio_src, after=lambda e: play_next(ctx, ctx.voice_client))
-            await ctx.send(f"🎶 Now playing: {title}")
+            await ctx.send(f"🎶 Now playing: {first['title']}")
 
     except DownloadError as e:
         await ctx.send("❌ Could not download or play the video. It may be restricted.")
         print(f"[yt_dlp] DownloadError: {e}")
+        if log_buffer:
+            print("=== yt-dlp log start ===")
+            for line in log_buffer:
+                print(line)
+            print("=== yt-dlp log end ===")
+        traceback.print_exc()
     except Exception as e:
         await ctx.send("❌ An error occurred while processing the request.")
         print(f"[play error] {e}")
+        if log_buffer:
+            print("=== yt-dlp log start ===")
+            for line in log_buffer:
+                print(line)
+            print("=== yt-dlp log end ===")
+        traceback.print_exc()
+
+
 
 # STOP PLAYING MUSIC
 @bot.command()
@@ -475,6 +588,8 @@ async def on_message(message):
         await message.channel.send("https://tenor.com/view/flutterpage-flutterpage-reverse-1999-flutterpage-bonk-gif-7260436718441088941")
         await message.channel.send("https://tenor.com/view/flutterpage-reverse-1999-re1999-good-morning-gif-1593186061945744120")
         await message.channel.send("https://cdn.discordapp.com/attachments/312670434921283584/1379595561413509150/iu.png?ex=6840cffd&is=683f7e7d&hm=f2a6ad2f859cfce8398ab7fcc3d7dedbf7f7efdb5749fb55d441af72407403c3&")
+        await message.channel.send("https://pbs.twimg.com/media/G7USQw6bcAAgTNp?format=jpg&name=large")
+        await message.channel.send("https://pbs.twimg.com/media/G3hbGajWoAA5osw?format=jpg&name=large")
         return
     
     if message.content.strip() == "cementeater":
@@ -517,6 +632,7 @@ async def editBatchMessage(batch_game, new_content):
             
             await messageToEdit.edit(content=new_content)
         print("Edited batch messages for game:", batch_game, "in", len(messages), "servers.")
+        await channel.send(f"Edited batch messages for game: {batch_game} in {len(messages)} servers.")
 
     except discord.NotFound:
         cursor.execute("DELETE FROM new_table WHERE batchlinked_id = %s", (messageID,))

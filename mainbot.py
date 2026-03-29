@@ -1,23 +1,25 @@
 # IMPORT
-import discord
+import discord #discord.py
 from discord.ext import commands, tasks
 from discord import FFmpegPCMAudio, PCMVolumeTransformer
-from discord.ext import commands
+from discord import app_commands #modified to support slash commands and remove redundant import
 from collections import deque
 import os
-from dotenv import load_dotenv
+from dotenv import load_dotenv #python-dotenv
 import asyncio
 import re
 import datetime
 import calendar
-import mysql.connector
-import yt_dlp
+import mysql.connector #mysql-connector-python
+import yt_dlp #yt-dlp
 from yt_dlp.utils import DownloadError
-import validators
+import validators #validators
 import traceback
 import sys
 import logging
 #logging.basicConfig(level=logging.DEBUG)
+
+import random #for peace's post function
 
 
 # LOAD ENV AND INTENTS
@@ -32,7 +34,19 @@ reminderCheckInterval = 20
 song_queues = {}
 
 # BOT SETUP ###################################################################################################################
-bot = commands.Bot(command_prefix=operator, intents=intents, help_command=None)
+#bot = commands.Bot(command_prefix=operator, intents=intents, help_command=None)
+
+#command tree setup for application/slash commands
+class SlashBot(commands.Bot):
+    def __init__(self) -> None:
+        super().__init__(command_prefix=operator, intents=intents, help_command=None)
+        #self.tree = discord.app_commands.CommandTree(self)
+
+    async def setup_hook(self) -> None:
+        self.tree.copy_global_to(guild=discord.Object(id=1234567890098765))
+        await self.tree.sync()
+
+bot = SlashBot()
 
 def get_queue(guild_id):
     if guild_id not in song_queues:
@@ -65,7 +79,8 @@ commandList = {
     "stop": "Stop playing music and leave the voice channel.",
     "skip": "Skip the currently playing song.",
     "code": "Generate a gift link for a code (GI/HSR): '{operator}gift <gi|hsr> <CODE>'",
-    "gift": "Generate Hoyoverse gift links for GI or HSR: '{operator}gift <gi|hsr> <CODE1> [<CODE2> ...])'"
+    "gift": "Generate Hoyoverse gift links for GI or HSR: '{operator}gift <gi|hsr> <CODE1> [<CODE2> ...])'",
+    "post": "Posts a databased image of a character: '{operator}post <char name> <number images>'"
 }
 
 gameList = {
@@ -390,11 +405,11 @@ async def gift(ctx):
 ### SLASH COMMANDS ###################################################################################################################
 ##
 
-@bot.slash_command(name="gift", description="Generate Hoyoverse gift links for GI or HSR")
-async def gift_slash(ctx: discord.ApplicationContext, game: str, codes: str):
+@bot.tree.command(name="gift", description="Generate Hoyoverse gift links for GI or HSR")
+async def gift_slash(interaction: discord.Interaction, game: str, codes: str):
     game = game.lower()
     if game not in ("gi", "hsr", "zzz"):
-        await ctx.respond("Game must be 'gi', 'hsr', or 'zzz'.", ephemeral=True)
+        await interaction.response.send_message("Game must be 'gi', 'hsr', or 'zzz'.", ephemeral=True)
         return
 
     code_list = codes.upper().split()
@@ -410,7 +425,7 @@ async def gift_slash(ctx: discord.ApplicationContext, game: str, codes: str):
 
         links.append(f"{code}: {url}")
 
-    await ctx.respond("\n".join(links))
+    await interaction.response.send_message("\n".join(links))
 
 # TEXT RESPONSES
 @bot.event
@@ -638,12 +653,59 @@ def daySuffix(day):
     else:
         return {1: 'st', 2: 'nd', 3: 'rd'}.get(day % 10, 'th')
 
+##
+### Peace Coding an image poster ####################################################################################################
+##
+
+peace_character_list = {} #empty dictionary
+peace_os_path = ""
+
+def post_init(): #assembles character list that can be posted
+    random.seed()
+
+    peace_os_path = os.path.join(os.getcwd(), "post")
+
+    if not(os.path.exists(peace_os_path)):
+        sys.exit("Please remember to make a \"post\" directory.")
+
+    for item in os.listdir(peace_os_path): #assumes url lists are in files "nilou.char"
+        if len(item) <= 6: #input error checking
+            continue
+        if item[-5:] == ".char":
+            peace_character_list[item[:-5].lower()] = item
+
+@bot.command() #needs the parentheses, unlike @bot.event . . .
+async def post(ctx, char_name = "nilou", count = 1): #the actual command
+    #check if character has an attached list of urls
+    if not (char_name.lower() in peace_character_list):
+        await ctx.send(f"Sorry no url list is available for {char_name}.")
+        return
+    
+    #check url file
+    peace_os_path = os.path.join(os.getcwd(), "post") #variable seems to get wiped/reset after you leave post_init() . . . strange
+    my_file = open(os.path.join(peace_os_path, peace_character_list[char_name.lower()]))
+
+    my_data = []
+    for line in my_file:
+        my_data.append(line)
+
+    if len(my_data) == 0: #error checking
+        await ctx.send(f"Sorry, the url list for {char_name} is empty.")
+        return
+
+    for i in range(max(count, 1)): #prints at least 1 url
+        url_num = random.randint(0, len(my_data) - 1)
+        await ctx.send(f"{my_data[url_num]}")
+
+
 # BOT READY EVENT ###################################################################################################################
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user}')
     check_reminders.start()
     check_batch.start()
+
+    post_init() #for peace's post command
 
 # RUN  
 if __name__ == "__main__":
@@ -652,6 +714,7 @@ if __name__ == "__main__":
 
     try:
         bot.run(os.getenv("CALENDARBOT_KEY"))
+
     except KeyboardInterrupt:
         print("Bot shut down manually.")
         sys.exit(0)
